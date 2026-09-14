@@ -27,8 +27,8 @@ PathHelper 是一个 Windows 文件对话框增强工具，通过注入 DLL 到�
 ## 系统要求
 
 - **操作系统**：Windows 10/11（64 位）
-- **开发环境**：Visual Studio 2022/2026
-- **运行时**：需要 Visual C++ Redistributable 2022
+- **开发环境**：Visual Studio 2022/2026，或 MinGW-w64（GCC 11 及以上，含 g++ / windres）
+- **运行时**：VS 构建需要 Visual C++ Redistributable 2022；MinGW 构建为静态链接，不依赖额外运行库
 - **权限**：需要管理员权限进行 DLL 注入
 
 ## 安装说明
@@ -47,6 +47,19 @@ PathHelper 是一个 Windows 文件对话框增强工具，通过注入 DLL 到�
 3. 选择 Release 配置（x64 或 Win32）
 4. 构建解决方案
 5. 输出文件位于 `Release/` 目录
+
+### 方式三：使用 MinGW-w64（g++）构建
+没有安装 Visual Studio 时，可以直接用 MinGW-w64 的 g++ 编译（仅 64 位）：
+
+1. 安装 MinGW-w64（建议 UCRT 版），确认 `g++`、`windres` 在 PATH 中
+2. 在仓库根目录执行：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\build_mingw.ps1 -Clean
+   ```
+3. 构建产物位于 `Release/`：`PathHelper.exe` 与 `Dll1.dll`（两者必须放在同一目录）
+
+脚本会同时编译主程序和注入 DLL；产物为静态链接，不依赖 `libstdc++-6.dll` 等运行时库。
+如果 `g++` 用于 x86 目标，请改用对应的 32 位工具链并自行调整。
 
 ## 使用方法
 
@@ -135,7 +148,10 @@ PathHelper/
 1. 需要安装 Windows SDK
 2. 项目使用 Unicode 字符集
 3. 需要链接 `ole32.lib`、`shell32.lib`、`d2d1.lib` 等库
-4. 管理员权限需要 UAC 清单配置
+4. 管理员权限需要 UAC 清单配置（清单见 `PathHelper/PathHelper.manifest`，MinGW 构建会自动嵌入）
+5. 为兼容 GCC，`Dll1` 中原先使用 MSVC `__try/__except` 的防御性代码改成了 `IsValidComObject()` / `IsReadableMemory()` 指针校验（见 `Dll1/common.h`），在 MSVC 与 MinGW 下均可编译
+6. `PathHelper.rc` 被 VS 保存为 UTF-16LE，windres 无法直接读取，`build_mingw.ps1` 会先转成 UTF-8 再用 `--codepage=65001` 编译
+7. MinGW 的 gcc 默认会链入自带的 `default-manifest.o`，与自定义清单冲突，脚本通过自定义 specs 去掉该注入
 
 ### 调试技巧
 1. 使用 DebugView 查看调试输出

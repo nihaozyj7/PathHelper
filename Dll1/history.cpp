@@ -2,6 +2,7 @@
 #include "history.h"
 #include "settings.h"
 #include <unordered_set>
+#include <cwctype>
 
 std::vector<HistoryEntry> g_historyCache;
 bool g_historyCacheValid = false;
@@ -25,66 +26,109 @@ static std::wstring GetHistoryFilePath()
     return dir + L"\\" + name + L".jsonl";
 }
 
-void WritePathToHistory(const std::wstring &path)
+// ── 路径归一化（正确处理 UNC / 映射驱动器 / 根目录） ──
+//
+// 旧实现直接用 rfind('\\') 截断，对网络路径有两个问题：
+//   1. 网络共享/离线路径 GetFileAttributes 会失败，此时即使传入的已经是文件夹也会被多截一层；
+//   2. \\server\share 这类共享根会被退化成 \\server。
+// 这里先区分“文件 / 文件夹 / 未知”，并且绝不上溯超过根目录。
+
+static bool IsDriveRootPath(const std::wstring &p)
 {
-    std::wstring folderPath = path;
-    if (!folderPath.empty() && folderPath.back() != L'\\')
+    if (p.size() == 2 && p[1] == L':' && iswalpha(p[0]))
+        return true;
+    if (p.size() == 3 && p[1] == L':' && p[2] == L'\\' && iswalpha(p[0]))
+        return true;
+    return false;
+}
+
+static bool IsUncShareRootPath(const std::wstring &p)
+{
+    if (p.size() < 3 || p[0] != L'\\' || p[1] != L'\\')
+        return false;
+    size_t s1 = p.find(L'\\', 2);
+    if (s1 == std::wstring::npos)
+        return true; // \\server
+    size_t s2 = p.find(L'\\', s1 + 1);
+    if (s2 == std::wstring::npos)
+        return true; // \\server\share
+    return s2 + 1 == p.size(); // 形如 \\server\share 且仅末尾多一个分隔符
+}
+
+// 统一分隔符并去掉末尾分隔符，但保留 "C:\\" / "\\server\share" 这类根
+static std::wstring TrimTrailingSeparators(std::wstring p)
+{
+    for (auto &c : p)
     {
-        DWORD attrs = GetFileAttributesW(folderPath.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES)
-        {
-            size_t pos = folderPath.rfind(L'\\');
-            if (pos != std::wstring::npos && pos > 0)
-                folderPath = folderPath.substr(0, pos);
-        }
-        else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
-        {
-            size_t pos = folderPath.rfind(L'\\');
-            if (pos != std::wstring::npos && pos > 0)
-                folderPath = folderPath.substr(0, pos);
-        }
+        if (c == L'/')
+            c = L'\\';
+    }
+    while (p.size() > 1 && p.back() == L'\\')
+    {
+        if (IsDriveRootPath(p) || IsUncShareRootPath(p))
+            break;
+        p.pop_back();
+    }
+    return p;
+}
+
+static std::wstring ParentFolderOf(const std::wstring &path)
+{
+    std::wstring p = TrimTrailingSeparators(path);
+    if (p.empty())
+        return p;
+    if (IsDriveRootPath(p) || IsUncShareRootPath(p))
+        return p;
+
+    size_t pos = p.rfind(L'\\');
+    if (pos == std::wstring::npos || pos == 0)
+        return p;
+
+    std::wstring parent = p.substr(0, pos);
+    if (parent.size() == 2 && parent[1] == L':' && iswalpha(parent[0]))
+        parent += L'\\'; // "Z:" -> "Z:\\"
+    return parent;
+}
+
+static std::wstring LastComponentOf(const std::wstring &path)
+{
+    std::wstring p = TrimTrailingSeparators(path);
+    size_t pos = p.rfind(L'\\');
+    if (pos == std::wstring::npos)
+        return p;
+    return p.substr(pos + 1);
+}
+
+// 仅在无法访问路径（网络共享不可达/无权限）时使用的兜底判断
+static bool LooksLikeFileName(const std::wstring &name)
+{
+    if (name.empty() || name == L"." || name == L"..")
+        return false;
+    size_t dot = name.rfind(L'.');
+    return dot != std::wstring::npos && dot > 0 && dot + 1 < name.size();
+}
+
+static std::wstring DeriveFolderPath(const std::wstring &path)
+{
+    if (path.empty())
+        return L"";
+
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES)
+    {
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY)
+            return TrimTrailingSeparators(path);
+        return ParentFolderOf(path);
     }
 
-    std::wstring filePath = GetHistoryFilePath();
-    if (filePath.empty())
-        return;
+    if (LooksLikeFileName(LastComponentOf(path)))
+        return ParentFolderOf(path);
+    return TrimTrailingSeparators(path);
+}
 
-    size_t pos = filePath.rfind(L'\\');
-    if (pos != std::wstring::npos)
-        SHCreateDirectoryExW(NULL, filePath.substr(0, pos).c_str(), NULL);
-
-    EnterCriticalSection(&g_cs);
-
-    if (!g_historyCacheValid)
-    {
-        LeaveCriticalSection(&g_cs);
-        LoadHistoryPaths();
-        EnterCriticalSection(&g_cs);
-    }
-
-    std::wstring normPath = folderPath;
-    if (!normPath.empty() && normPath.back() == L'\\')
-        normPath.pop_back();
-    std::transform(normPath.begin(), normPath.end(), normPath.begin(), ::towlower);
-    g_historyCache.erase(std::remove_if(g_historyCache.begin(), g_historyCache.end(), [&](const HistoryEntry &e) {
-        std::wstring np = e.path;
-        if (!np.empty() && np.back() == L'\\')
-            np.pop_back();
-        std::transform(np.begin(), np.end(), np.begin(), ::towlower);
-        return np == normPath;
-    }), g_historyCache.end());
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t timestamp[32];
-    swprintf_s(timestamp, L"%04d-%02d-%02dT%02d:%02d:%02d",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-    g_historyCache.insert(g_historyCache.begin(), HistoryEntry{folderPath, timestamp});
-
-    if (g_historyCache.size() > (size_t)MAX_HISTORY_ENTRIES)
-        g_historyCache.resize(MAX_HISTORY_ENTRIES);
-
+// 调用前需持有 g_cs
+static void WriteHistoryFileLocked(const std::wstring &filePath)
+{
     std::string output;
     for (size_t i = 0; i < g_historyCache.size(); ++i)
     {
@@ -107,8 +151,108 @@ void WritePathToHistory(const std::wstring &path)
         if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING))
             DeleteFileW(tmpPath.c_str());
     }
+}
+
+// 一次写入多个文件夹（多选打开时用），只落盘一次
+void WriteFoldersToHistory(const std::vector<std::wstring> &folders)
+{
+    if (folders.empty())
+        return;
+
+    std::wstring filePath = GetHistoryFilePath();
+    if (filePath.empty())
+        return;
+
+    size_t pos = filePath.rfind(L'\\');
+    if (pos != std::wstring::npos)
+        SHCreateDirectoryExW(NULL, filePath.substr(0, pos).c_str(), NULL);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t timestamp[32];
+    swprintf_s(timestamp, L"%04d-%02d-%02dT%02d:%02d:%02d",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    EnterCriticalSection(&g_cs);
+
+    if (!g_historyCacheValid)
+    {
+        LeaveCriticalSection(&g_cs);
+        LoadHistoryPaths();
+        EnterCriticalSection(&g_cs);
+    }
+
+    for (const auto &folder : folders)
+    {
+        if (folder.empty())
+            continue;
+
+        std::wstring normPath = NormalizePath(folder);
+        g_historyCache.erase(std::remove_if(g_historyCache.begin(), g_historyCache.end(), [&](const HistoryEntry &e) {
+            return NormalizePath(e.path) == normPath;
+        }), g_historyCache.end());
+
+        g_historyCache.insert(g_historyCache.begin(), HistoryEntry{folder, timestamp});
+    }
+
+    if (g_historyCache.size() > (size_t)MAX_HISTORY_ENTRIES)
+        g_historyCache.resize(MAX_HISTORY_ENTRIES);
+
+    WriteHistoryFileLocked(filePath);
 
     LeaveCriticalSection(&g_cs);
+}
+
+void WriteFolderToHistory(const std::wstring &folder)
+{
+    std::wstring f = TrimTrailingSeparators(folder);
+    if (f.empty())
+        return;
+    WriteFoldersToHistory({f});
+}
+
+void WritePathToHistory(const std::wstring &path)
+{
+    std::wstring folderPath = DeriveFolderPath(path);
+    if (folderPath.empty())
+        return;
+    WriteFoldersToHistory({folderPath});
+}
+
+// 多选打开：把每个选中项所在目录都记录下来。
+// 同一批文件通常在同一目录，这里复用上一次的 stat 结果，避免逐个访问网络路径。
+void WritePathsToHistory(const std::vector<std::wstring> &paths)
+{
+    std::vector<std::wstring> folders;
+    folders.reserve(paths.size());
+
+    std::wstring cachedParent;
+    std::wstring cachedFolder;
+    bool haveCached = false;
+
+    for (const auto &p : paths)
+    {
+        if (p.empty())
+            continue;
+
+        std::wstring parent = ParentFolderOf(p);
+        std::wstring folder;
+
+        if (haveCached && cachedFolder == cachedParent && parent == cachedParent)
+            folder = cachedParent;
+        else
+        {
+            folder = DeriveFolderPath(p);
+            cachedParent = parent;
+            cachedFolder = folder;
+            haveCached = true;
+        }
+
+        if (!folder.empty())
+            folders.push_back(std::move(folder));
+    }
+
+    WriteFoldersToHistory(folders);
 }
 
 std::wstring GetExplorerPathsFilePath()

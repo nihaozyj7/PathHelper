@@ -378,3 +378,6 @@ $RECYCLE.BIN/
 # Project-specific build output directories
 Dll1/Dll1/
 PathHelper/PathHelper/
+
+# MinGW-w64 (g++) 构建脚本的中间目录，产物在 Release/
+build/

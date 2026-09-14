@@ -6,7 +6,12 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <d2d1_1.h>
+#include <unordered_map>
 #pragma comment(lib, "uxtheme.lib")
+
+// 文本布局缓存代次：ComputeLayoutMetrics() 重建字体/格式时自增，
+// 让缓存中的 IDWriteTextLayout 失效。
+int g_textLayoutGeneration = 0;
 
 int g_itemFontPixelHeight = 13;
 int g_itemFontPixelHeightSecondary = 10;
@@ -93,6 +98,9 @@ void ComputeLayoutMetrics()
             DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
             headerSize, L"zh-CN", &g_pHeaderTextFormat);
     }
+
+    // 字体/格式已重建，让文本布局缓存失效
+    ++g_textLayoutGeneration;
 }
 
 // ── Modern color palette ──
@@ -194,70 +202,208 @@ static void FallbackDrawText(HDC hdc, const RECT& rc, const wchar_t* text,
     if (hOldFont) SelectObject(hdc, hOldFont);
 }
 
+// 面板绘制全部发生在 HookThread 上，因此这里的缓存无需加锁。
+//
+// 旧实现每绘制一行文字都会重新创建 ID2D1DCRenderTarget / IDWriteTextLayout /
+// ID2D1SolidColorBrush，一个列表每帧可能创建几十个 D2D 资源，这是滚动卡顿的主因。
+// 现在复用同一个 DC 渲染目标，并按 (格式, 尺寸, 文本) 缓存文本布局。
+static ID2D1DCRenderTarget *g_pTextRT = nullptr;
+static ID2D1DeviceContext *g_pTextDevCtx = nullptr;
+static ID2D1SolidColorBrush *g_pTextBrush = nullptr;
+static std::unordered_map<std::wstring, IDWriteTextLayout *> g_layoutCache;
+
+static void ClearLayoutCache()
+{
+    for (auto &kv : g_layoutCache)
+    {
+        if (kv.second)
+            kv.second->Release();
+    }
+    g_layoutCache.clear();
+}
+
+void ReleaseDWriteCache()
+{
+    ClearLayoutCache();
+    if (g_pTextBrush) { g_pTextBrush->Release(); g_pTextBrush = nullptr; }
+    if (g_pTextDevCtx) { g_pTextDevCtx->Release(); g_pTextDevCtx = nullptr; }
+    if (g_pTextRT) { g_pTextRT->Release(); g_pTextRT = nullptr; }
+}
+
+// 只有需要彩色字体（emoji 等）的文本才走较慢的 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT 路径
+static bool TextNeedsColorFont(const wchar_t *text)
+{
+    for (const wchar_t *p = text; p && *p; ++p)
+    {
+        wchar_t c = *p;
+        if ((c >= 0xD800 && c <= 0xDFFF) || (c >= 0x2190 && c <= 0x2BFF) || c == 0xFE0F)
+            return true;
+    }
+    return false;
+}
+
+static IDWriteTextLayout *GetCachedTextLayout(const wchar_t *text, UINT32 textLen,
+                                              IDWriteTextFormat *format,
+                                              FLOAT widthDIP, FLOAT heightDIP, UINT dtFlags)
+{
+    wchar_t meta[96];
+    swprintf_s(meta, L"%d|%p|%d|%d|%u|", g_textLayoutGeneration, (void *)format,
+               (int)(widthDIP * 16.0f + 0.5f), (int)(heightDIP * 16.0f + 0.5f), dtFlags);
+
+    std::wstring key(meta);
+    key.append(text, textLen);
+
+    auto it = g_layoutCache.find(key);
+    if (it != g_layoutCache.end())
+        return it->second;
+
+    if (g_layoutCache.size() >= 512)
+        ClearLayoutCache();
+
+    IDWriteTextLayout *pLayout = nullptr;
+    if (FAILED(g_pDWriteFactory->CreateTextLayout(text, textLen, format, widthDIP, heightDIP, &pLayout)) || !pLayout)
+        return nullptr;
+
+    pLayout->SetTextAlignment((dtFlags & DT_CENTER) ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
+    pLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (dtFlags & DT_SINGLELINE)
+        pLayout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+    g_layoutCache.emplace(std::move(key), pLayout);
+    return pLayout;
+}
+
 void DWriteDrawText(HDC hdc, const RECT& rc, const wchar_t* text,
                     IDWriteTextFormat* format, HFONT fallbackFont,
                     COLORREF color, UINT dtFlags)
 {
-    if (g_pD2DFactory && g_pDWriteFactory && format && text)
+    if (!hdc || !text || !format || !g_pD2DFactory || !g_pDWriteFactory)
     {
-        ID2D1DCRenderTarget* pRT = nullptr;
+        FallbackDrawText(hdc, rc, text, fallbackFont, color, dtFlags);
+        return;
+    }
+
+    if (!g_pTextRT)
+    {
         D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_DEFAULT,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
             0, 0,
             D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE);
-        if (SUCCEEDED(g_pD2DFactory->CreateDCRenderTarget(&props, &pRT)))
-        {
-            pRT->BindDC(hdc, &rc);
-            pRT->BeginDraw();
-
-            FLOAT dpiX, dpiY;
-            pRT->GetDpi(&dpiX, &dpiY);
-
-            FLOAT widthDIP = (rc.right - rc.left) * 96.0f / dpiX;
-            FLOAT heightDIP = (rc.bottom - rc.top) * 96.0f / dpiY;
-
-            IDWriteTextLayout* pLayout = nullptr;
-            if (SUCCEEDED(g_pDWriteFactory->CreateTextLayout(
-                    text, (UINT32)wcslen(text), format, widthDIP, heightDIP, &pLayout)))
-            {
-                DWRITE_TEXT_ALIGNMENT align = (dtFlags & DT_CENTER)
-                                                  ? DWRITE_TEXT_ALIGNMENT_CENTER
-                                                  : DWRITE_TEXT_ALIGNMENT_LEADING;
-                pLayout->SetTextAlignment(align);
-                pLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                if (dtFlags & DT_SINGLELINE)
-                    pLayout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-
-                D2D1_COLOR_F c = D2D1::ColorF(
-                    GetRValue(color) / 255.0f,
-                    GetGValue(color) / 255.0f,
-                    GetBValue(color) / 255.0f);
-                ID2D1SolidColorBrush* pBrush = nullptr;
-                if (SUCCEEDED(pRT->CreateSolidColorBrush(c, &pBrush)))
-                {
-                    ID2D1DeviceContext *pDevCtx = nullptr;
-                    if (SUCCEEDED(pRT->QueryInterface(IID_PPV_ARGS(&pDevCtx))))
-                    {
-                        pDevCtx->DrawTextLayout(D2D1::Point2F(0, 0), pLayout, pBrush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                        pDevCtx->Release();
-                    }
-                    else
-                    {
-                        pRT->DrawTextLayout(D2D1::Point2F(0, 0), pLayout, pBrush);
-                    }
-                    pBrush->Release();
-                }
-                pLayout->Release();
-            }
-
-            pRT->EndDraw();
-            pRT->Release();
-            return;
-        }
+        if (FAILED(g_pD2DFactory->CreateDCRenderTarget(&props, &g_pTextRT)))
+            g_pTextRT = nullptr;
+        else
+            g_pTextRT->QueryInterface(IID_PPV_ARGS(&g_pTextDevCtx));
     }
 
-    FallbackDrawText(hdc, rc, text, fallbackFont, color, dtFlags);
+    if (!g_pTextRT || FAILED(g_pTextRT->BindDC(hdc, &rc)))
+    {
+        FallbackDrawText(hdc, rc, text, fallbackFont, color, dtFlags);
+        return;
+    }
+
+    FLOAT dpiX = 96.0f, dpiY = 96.0f;
+    g_pTextRT->GetDpi(&dpiX, &dpiY);
+    if (dpiX <= 0.0f) dpiX = 96.0f;
+    if (dpiY <= 0.0f) dpiY = 96.0f;
+
+    FLOAT widthDIP = (rc.right - rc.left) * 96.0f / dpiX;
+    FLOAT heightDIP = (rc.bottom - rc.top) * 96.0f / dpiY;
+
+    IDWriteTextLayout *pLayout = GetCachedTextLayout(text, (UINT32)wcslen(text), format, widthDIP, heightDIP, dtFlags);
+    if (!pLayout)
+    {
+        FallbackDrawText(hdc, rc, text, fallbackFont, color, dtFlags);
+        return;
+    }
+
+    bool drew = false;
+    g_pTextRT->BeginDraw();
+    if (!g_pTextBrush)
+        g_pTextRT->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), &g_pTextBrush);
+    if (g_pTextBrush)
+    {
+        g_pTextBrush->SetColor(D2D1::ColorF(GetRValue(color) / 255.0f,
+                                            GetGValue(color) / 255.0f,
+                                            GetBValue(color) / 255.0f));
+        if (g_pTextDevCtx && TextNeedsColorFont(text))
+            g_pTextDevCtx->DrawTextLayout(D2D1::Point2F(0, 0), pLayout, g_pTextBrush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        else
+            g_pTextRT->DrawTextLayout(D2D1::Point2F(0, 0), pLayout, g_pTextBrush);
+        drew = true;
+    }
+    HRESULT hrEnd = g_pTextRT->EndDraw();
+    if (hrEnd == D2DERR_RECREATE_TARGET)
+        ReleaseDWriteCache();
+    else if (!drew)
+        FallbackDrawText(hdc, rc, text, fallbackFont, color, dtFlags);
+}
+
+// ── 双缓冲后台位图缓存 ──
+// 列表每次重绘都新建/销毁兼容位图会造成明显的 GDI 抖动，这里按窗口 + 尺寸缓存。
+struct WindowBackBuffer
+{
+    HDC dc = nullptr;
+    HBITMAP bmp = nullptr;
+    HBITMAP oldBmp = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
+static WindowBackBuffer *GetWindowBackBuffer(HWND hwnd, HDC refDC, int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return nullptr;
+
+    auto *bb = (WindowBackBuffer *)GetPropW(hwnd, L"BackBuffer");
+    if (!bb)
+    {
+        bb = new WindowBackBuffer();
+        SetPropW(hwnd, L"BackBuffer", (HANDLE)bb);
+    }
+
+    if (bb->dc && bb->width == width && bb->height == height)
+        return bb;
+
+    if (bb->bmp)
+    {
+        if (bb->oldBmp)
+            SelectObject(bb->dc, bb->oldBmp);
+        DeleteObject(bb->bmp);
+        bb->bmp = nullptr;
+        bb->oldBmp = nullptr;
+    }
+    if (!bb->dc)
+        bb->dc = CreateCompatibleDC(refDC);
+    if (!bb->dc)
+        return nullptr;
+
+    bb->bmp = CreateCompatibleBitmap(refDC, width, height);
+    if (!bb->bmp)
+        return nullptr;
+
+    bb->oldBmp = (HBITMAP)SelectObject(bb->dc, bb->bmp);
+    bb->width = width;
+    bb->height = height;
+    return bb;
+}
+
+static void DestroyWindowBackBuffer(HWND hwnd)
+{
+    auto *bb = (WindowBackBuffer *)GetPropW(hwnd, L"BackBuffer");
+    if (!bb)
+        return;
+
+    if (bb->bmp)
+    {
+        if (bb->oldBmp)
+            SelectObject(bb->dc, bb->oldBmp);
+        DeleteObject(bb->bmp);
+    }
+    if (bb->dc)
+        DeleteDC(bb->dc);
+    delete bb;
+    RemovePropW(hwnd, L"BackBuffer");
 }
 
 // ── Custom self-drawn list control ──
@@ -267,7 +413,7 @@ constexpr auto CLS_CUSTOM_LIST = L"PathHelperListClass";
 static int GetListVisibleWidth(HWND hwnd);
 
 static bool PromptBookmarkNote(HWND hwndParent, const std::wstring &path, const std::wstring &initialNote, std::wstring &outNote);
-static void UpdateFavBtnMode(HWND hwnd);
+static void UpdateFavBtnMode(HWND hwnd, bool force = false);
 static void BuildBookmarkListData(HWND hwndPanel, int preserveScrollTo = -1);
 
 struct CustomListItem
@@ -325,6 +471,22 @@ static void ClampScrollOffset(HWND hwnd)
         data->scrollOffset = maxScroll;
 }
 
+// 只重绘发生变化的那一行，避免整列表重绘
+static void InvalidateListItem(HWND hwnd, int idx)
+{
+    if (idx < 0)
+        return;
+    CustomListData *data = GetListData(hwnd);
+    if (!data || idx >= (int)data->items.size())
+        return;
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int y = idx * g_itemHeight - data->scrollOffset;
+    RECT itemRc = {rc.left, y, rc.right, y + g_itemHeight};
+    InvalidateRect(hwnd, &itemRc, FALSE);
+}
+
 static void DrawListScrollIndicator(HWND hwnd, HDC hdc, const RECT &rc)
 {
     CustomListData *data = GetListData(hwnd);
@@ -341,7 +503,7 @@ static void DrawListScrollIndicator(HWND hwnd, HDC hdc, const RECT &rc)
     bool isDark = IsDarkCached();
     auto colors = GetThemeColors(isDark);
 
-    int thumbHeight = max(visibleHeight * visibleHeight / totalHeight, 20);
+    int thumbHeight = (std::max)(visibleHeight * visibleHeight / totalHeight, 20);
     int thumbTop = rc.top + (int)((LONG64)data->scrollOffset * (visibleHeight - thumbHeight) / maxScroll);
     int thumbWidth = 4;
     int thumbX = rc.right - thumbWidth - 1;
@@ -373,9 +535,13 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         bool isDark = IsDarkCached();
         auto colors = GetThemeColors(isDark);
 
-        HDC memDC = CreateCompatibleDC(hdc);
-        HBITMAP memBmp = CreateCompatibleBitmap(hdc, cx, cy);
-        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+        WindowBackBuffer *backBuffer = GetWindowBackBuffer(hwnd, hdc, cx, cy);
+        if (!backBuffer)
+        {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        HDC memDC = backBuffer->dc;
 
         SetDCBrushColor(memDC, colors.bg);
         FillRect(memDC, &rc, (HBRUSH)GetStockObject(DC_BRUSH));
@@ -383,9 +549,6 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (!data)
         {
             BitBlt(hdc, 0, 0, cx, cy, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBmp);
-            DeleteObject(memBmp);
-            DeleteDC(memDC);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -496,9 +659,6 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         DrawListScrollIndicator(hwnd, memDC, rc);
 
         BitBlt(hdc, 0, 0, cx, cy, memDC, 0, 0, SRCCOPY);
-        SelectObject(memDC, oldBmp);
-        DeleteObject(memBmp);
-        DeleteDC(memDC);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -580,8 +740,10 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 
         if (idx != data->hoverIdx)
         {
+            int oldIdx = data->hoverIdx;
             data->hoverIdx = idx;
-            InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateListItem(hwnd, oldIdx);
+            InvalidateListItem(hwnd, idx);
         }
 
         TRACKMOUSEEVENT tme = {sizeof(tme)};
@@ -596,8 +758,9 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CustomListData *data = GetListData(hwnd);
         if (data && data->hoverIdx != -1)
         {
+            int oldIdx = data->hoverIdx;
             data->hoverIdx = -1;
-            InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateListItem(hwnd, oldIdx);
         }
         break;
     }
@@ -613,8 +776,10 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         int idx = y / g_itemHeight;
         if (idx >= 0 && idx < (int)data->items.size())
         {
+            int oldSel = data->selectedIdx;
             data->selectedIdx = idx;
-            InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateListItem(hwnd, oldSel);
+            InvalidateListItem(hwnd, idx);
             if (data->isFav)
             {
                 data->dragSrcIdx = idx;
@@ -642,8 +807,10 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         int idx = y / g_itemHeight;
         if (idx >= 0 && idx < (int)data->items.size())
         {
+            int oldSel = data->selectedIdx;
             data->selectedIdx = idx;
-            InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateListItem(hwnd, oldSel);
+            InvalidateListItem(hwnd, idx);
             if (!data->isFav)
                 SendMessageW(GetParent(hwnd), WM_COMMAND, MAKELONG(GetDlgCtrlID(hwnd), LBN_SELCHANGE), (LPARAM)hwnd);
         }
@@ -682,7 +849,7 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                         bookmarks->insert(bookmarks->begin() + effectiveDrop, std::move(entry));
                         SaveBookmarks(*bookmarks);
                         BuildBookmarkListData(hwndPanel, effectiveDrop);
-                        UpdateFavBtnMode(hwndPanel);
+                        UpdateFavBtnMode(hwndPanel, true);
                     }
                 }
             }
@@ -752,7 +919,7 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             bookmarks->erase(bookmarks->begin() + idx);
             SaveBookmarks(*bookmarks);
             BuildBookmarkListData(hwndPanel);
-            UpdateFavBtnMode(hwndPanel);
+            UpdateFavBtnMode(hwndPanel, true);
         }
         break;
     }
@@ -782,6 +949,7 @@ static LRESULT CALLBACK CustomListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             delete data;
             RemovePropW(hwnd, L"ListData");
         }
+        DestroyWindowBackBuffer(hwnd);
         break;
     }
     }
@@ -913,8 +1081,16 @@ static int GetFavHeaderTop()
     return g_headerHeight + g_historyListHeight + g_explorerHeaderHeight + g_explorerListHeight;
 }
 
-static void UpdateFavBtnMode(HWND hwnd)
+static void UpdateFavBtnMode(HWND hwnd, bool force)
 {
+    // 这里会向对话框线程发同步查询。若对话框正卡在慢速网络路径上，面板线程会被拖住，
+    // 表现为列表滚动卡顿。因此做节流 + 短超时，且超时后绝不在面板线程上做昂贵的回退查询。
+    static DWORD lastQueryTick = 0;
+    DWORD now = GetTickCount();
+    if (!force && (DWORD)(now - lastQueryTick) < 200)
+        return;
+    lastQueryTick = now;
+
     bool wasFav = (GetPropW(hwnd, L"FavBtnIsFav") != nullptr);
     bool isFav = false;
 
@@ -924,17 +1100,21 @@ static void UpdateFavBtnMode(HWND hwnd)
         auto *bookmarks = (std::vector<BookmarkEntry> *)GetPropW(hwnd, L"BookmarkData");
         if (bookmarks)
         {
-            SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 500, NULL);
-            std::wstring path = GetSelectedPath(hwndDialog);
-            if (!path.empty())
+            DWORD_PTR ignored = 0;
+            if (SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0,
+                                    SMTO_ABORTIFHUNG, 120, &ignored))
             {
-                std::wstring normPath = NormalizePath(path);
-                for (const auto &bm : *bookmarks)
+                std::wstring path;
+                if (TakeCachedDialogPath(hwndDialog, path) && !path.empty())
                 {
-                    if (NormalizePath(bm.path) == normPath)
+                    std::wstring normPath = NormalizePath(path);
+                    for (const auto &bm : *bookmarks)
                     {
-                        isFav = true;
-                        break;
+                        if (NormalizePath(bm.path) == normPath)
+                        {
+                            isFav = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1635,7 +1815,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HWND hwndDialog = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if (hwndDialog && IsWindow(hwndDialog))
             {
-                SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 500, NULL);
+                SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 200, NULL);
                 std::wstring path = GetSelectedPath(hwndDialog);
                 if (!path.empty())
                 {
@@ -1653,7 +1833,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HWND hwndDialog = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if (hwndDialog && IsWindow(hwndDialog))
             {
-                SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 500, NULL);
+                SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 200, NULL);
                 std::wstring path = GetSelectedPath(hwndDialog);
                 if (!path.empty())
                 {
@@ -1680,7 +1860,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!hwndDialog || !IsWindow(hwndDialog))
             return 0;
 
-        SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 500, NULL);
+        SendMessageTimeoutW(hwndDialog, WM_QUERY_FOLDER_PATH, 0, 0, SMTO_ABORTIFHUNG, 200, NULL);
         std::wstring path = GetSelectedPath(hwndDialog);
         if (path.empty())
             return 0;
@@ -1730,7 +1910,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SaveBookmarks(*bookmarks);
             BuildBookmarkListData(hwnd);
         }
-        UpdateFavBtnMode(hwnd);
+        UpdateFavBtnMode(hwnd, true);
         return 0;
     }
 
@@ -1746,9 +1926,13 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         bool isDark = IsDarkCached();
         auto colors = GetThemeColors(isDark);
 
-        HDC memDC = CreateCompatibleDC(hdc);
-        HBITMAP memBmp = CreateCompatibleBitmap(hdc, cx, cy);
-        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+        WindowBackBuffer *backBuffer = GetWindowBackBuffer(hwnd, hdc, cx, cy);
+        if (!backBuffer)
+        {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        HDC memDC = backBuffer->dc;
 
         SetDCBrushColor(memDC, colors.bg);
         FillRect(memDC, &rc, (HBRUSH)GetStockObject(DC_BRUSH));
@@ -1866,9 +2050,6 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DWriteDrawText(memDC, btnRc, isFav ? L"\U0001F4AB" : L"\u2B50", g_pHeaderTextFormat, g_hHeaderFont, isBtnHovered ? colors.accent : colors.btnText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
         BitBlt(hdc, 0, 0, cx, cy, memDC, 0, 0, SRCCOPY);
-        SelectObject(memDC, oldBmp);
-        DeleteObject(memBmp);
-        DeleteDC(memDC);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -1880,7 +2061,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_REFRESH_FAV_STATE:
     {
-        UpdateFavBtnMode(hwnd);
+        UpdateFavBtnMode(hwnd, true);
         return 0;
     }
     case WM_REFRESH_EXPLORER_PATHS:
@@ -1965,6 +2146,7 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
     {
         KillTimer(hwnd, 1);
+        DestroyWindowBackBuffer(hwnd);
         auto *paths = (std::vector<std::wstring> *)GetPropW(hwnd, L"HistoryPaths");
         if (paths)
         {
@@ -2114,7 +2296,7 @@ std::wstring histPrefix = g_settings.stripCommonPrefix ? CommonPathPrefix(std::v
     PositionPanel(hwndDialog, hwndPanel);
     ShowWindow(hwndPanel, SW_SHOWNA);
     SetPanelRegion(hwndPanel);
-    UpdateFavBtnMode(hwndPanel);
+    UpdateFavBtnMode(hwndPanel, true);
 
     return hwndPanel;
 }

@@ -49,6 +49,7 @@ struct DialogInfo
     WNDPROC originalProc;
     HWND hwndPanel;
     std::wstring cachedPath;
+    bool cachedPathValid = false;
 };
 
 struct VTableHookInfo
@@ -133,6 +134,10 @@ extern HANDLE g_hExplorerPathsNotify;
 
 std::wstring GetSelectedPath(HWND hwnd);
 
+// 取走（并清除）对话框最近一次 WM_QUERY_FOLDER_PATH 缓存的路径。
+// 返回 true 表示对话框已应答过该查询（路径本身可能为空字符串）。
+bool TakeCachedDialogPath(HWND hwndDialog, std::wstring &outPath);
+
 inline std::wstring NormalizePath(const std::wstring &path)
 {
     std::wstring result = path;
@@ -140,6 +145,40 @@ inline std::wstring NormalizePath(const std::wstring &path)
         result.pop_back();
     std::transform(result.begin(), result.end(), result.begin(), ::towlower);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// MinGW-w64 / GCC 不支持 MSVC 的 __try / __except 结构化异常处理，
+// 因此用“内存可读性检查”实现等价的防御性校验（MSVC 下同样可用）。
+// ---------------------------------------------------------------------------
+inline bool IsReadableMemory(const void *ptr, size_t size)
+{
+    if (!ptr || size == 0)
+        return false;
+
+    const unsigned char *p = static_cast<const unsigned char *>(ptr);
+    const unsigned char *end = p + size;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (p < end)
+    {
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi))
+            return false;
+        if (mbi.State != MEM_COMMIT)
+            return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+            return false;
+        p = static_cast<const unsigned char *>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
+// 调用 COM 虚表方法前，先确认对象指针及其虚表指针可读
+inline bool IsValidComObject(const void *p)
+{
+    if (!IsReadableMemory(p, sizeof(void *)))
+        return false;
+    const void *vtable = *reinterpret_cast<const void *const *>(p);
+    return IsReadableMemory(vtable, sizeof(void *));
 }
 
 constexpr int CORNER_RADIUS = 14;

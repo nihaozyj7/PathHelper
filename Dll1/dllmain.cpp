@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "settings.h"
 #include "history.h"
 #include "hooking.h"
@@ -77,10 +77,9 @@ static bool TryBrowseObjectViaShellView(HWND hwnd, const std::wstring &targetPat
         return false;
 
     IServiceProvider *pSP = nullptr;
-    HRESULT hr = [&]() -> HRESULT {
-        __try { return pShellView->QueryInterface(IID_IServiceProvider, (void **)&pSP); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return E_POINTER; }
-    }();
+    HRESULT hr = IsValidComObject(pShellView)
+                     ? pShellView->QueryInterface(IID_IServiceProvider, (void **)&pSP)
+                     : E_POINTER;
     if (FAILED(hr) || !pSP)
         return false;
 
@@ -96,18 +95,12 @@ static bool TryBrowseObjectViaShellView(HWND hwnd, const std::wstring &targetPat
         return false;
 
     PIDLIST_ABSOLUTE pidl = nullptr;
-    hr = [&]() -> HRESULT {
-        __try { return SHParseDisplayName(targetPath.c_str(), nullptr, &pidl, 0, nullptr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return E_POINTER; }
-    }();
+    hr = SHParseDisplayName(targetPath.c_str(), nullptr, &pidl, 0, nullptr);
 
     bool result = false;
     if (SUCCEEDED(hr) && pidl)
     {
-        hr = [&]() -> HRESULT {
-            __try { return pSB->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { return E_POINTER; }
-        }();
+        hr = pSB->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
         result = SUCCEEDED(hr);
         ILFree(pidl);
     }
@@ -233,10 +226,9 @@ static std::wstring GetSelectedPathCom(HWND hwnd)
         return result;
 
     IFolderView2 *pFolderView2 = nullptr;
-    HRESULT hr = [&]() -> HRESULT {
-        __try { return pShellView->QueryInterface(IID_IFolderView2, (void **)&pFolderView2); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return E_POINTER; }
-    }();
+    HRESULT hr = IsValidComObject(pShellView)
+                     ? pShellView->QueryInterface(IID_IFolderView2, (void **)&pFolderView2)
+                     : E_POINTER;
     if (FAILED(hr) || !pFolderView2)
         return result;
 
@@ -358,6 +350,7 @@ std::wstring GetSelectedPath(HWND hwnd)
         {
             std::wstring path = it->second.cachedPath;
             it->second.cachedPath.clear();
+            it->second.cachedPathValid = false;
             LeaveCriticalSection(&g_cs);
             
             return path;
@@ -477,6 +470,23 @@ std::wstring GetSelectedPath(HWND hwnd)
     return L"";
 }
 
+bool TakeCachedDialogPath(HWND hwndDialog, std::wstring &outPath)
+{
+    EnterCriticalSection(&g_cs);
+    auto it = g_dialogs.find(hwndDialog);
+    if (it == g_dialogs.end() || !it->second.cachedPathValid)
+    {
+        LeaveCriticalSection(&g_cs);
+        return false;
+    }
+
+    outPath = it->second.cachedPath;
+    it->second.cachedPath.clear();
+    it->second.cachedPathValid = false;
+    LeaveCriticalSection(&g_cs);
+    return true;
+}
+
 static LRESULT CALLBACK DialogSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     EnterCriticalSection(&g_cs);
@@ -548,6 +558,7 @@ static LRESULT CALLBACK DialogSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, 
         }
         EnterCriticalSection(&g_cs);
         info->cachedPath = path;
+        info->cachedPathValid = true;
         LeaveCriticalSection(&g_cs);
         return 0;
     }
@@ -763,6 +774,8 @@ static DWORD WINAPI HookThread(LPVOID)
         FindCloseChangeNotification(g_hExplorerPathsNotify);
         g_hExplorerPathsNotify = nullptr;
     }
+
+    ReleaseDWriteCache();
 
     if (g_pItemTextFormat) { g_pItemTextFormat->Release(); g_pItemTextFormat = nullptr; }
     if (g_pItemTextFormatBold) { g_pItemTextFormatBold->Release(); g_pItemTextFormatBold = nullptr; }

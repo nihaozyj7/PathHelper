@@ -11,14 +11,10 @@ std::vector<VTableHookInfo> g_hookedVtables;
 
 static HRESULT SafeQueryInterface(IUnknown *pUnk, REFIID riid, void **ppv)
 {
-    __try
-    {
-        return pUnk->QueryInterface(riid, ppv);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
+    if (!IsValidComObject(pUnk))
         return E_POINTER;
-    }
+
+    return pUnk->QueryInterface(riid, ppv);
 }
 
 HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
@@ -91,7 +87,9 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                 DWORD count = 0;
                 if (SUCCEEDED(pItems->GetCount(&count)) && count > 0)
                 {
-                    std::wstring lastPath;
+                    // 多选时要记录每个选中项所在目录，而不是只取最后一个
+                    std::vector<std::wstring> selectedPaths;
+                    selectedPaths.reserve(count);
                     for (DWORD i = 0; i < count; ++i)
                     {
                         IShellItem *pItem = nullptr;
@@ -100,7 +98,7 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                             LPWSTR path = nullptr;
                             if (SUCCEEDED(pItem->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path)
                             {
-                                lastPath = path;
+                                selectedPaths.push_back(path);
                                 CoTaskMemFree(path);
                             }
                             else
@@ -108,16 +106,16 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                                 LPWSTR parsingPath = nullptr;
                                 if (SUCCEEDED(pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parsingPath)) && parsingPath)
                                 {
-                                    lastPath = parsingPath;
+                                    selectedPaths.push_back(parsingPath);
                                     CoTaskMemFree(parsingPath);
                                 }
                             }
                             pItem->Release();
                         }
                     }
-                    if (!lastPath.empty())
+                    if (!selectedPaths.empty())
                     {
-                        WritePathToHistory(lastPath);
+                        WritePathsToHistory(selectedPaths);
                         recordedFromItemArray = true;
                     }
                 }
@@ -136,6 +134,7 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                 {
                     WritePathToHistory(path);
                     CoTaskMemFree(path);
+                    recordedFromItemArray = true;
                 }
                 else
                 {
@@ -144,6 +143,7 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                     {
                         WritePathToHistory(parsingPath);
                         CoTaskMemFree(parsingPath);
+                        recordedFromItemArray = true;
                     }
                     else
                     {
@@ -153,8 +153,9 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                             LPWSTR parentPath = nullptr;
                             if (SUCCEEDED(pParent->GetDisplayName(SIGDN_FILESYSPATH, &parentPath)) && parentPath)
                             {
-                                WritePathToHistory(parentPath);
+                                WriteFolderToHistory(parentPath);
                                 CoTaskMemFree(parentPath);
+                                recordedFromItemArray = true;
                             }
                             pParent->Release();
                         }
@@ -162,28 +163,31 @@ HRESULT STDMETHODCALLTYPE Hook_IFileDialog_Show(void *This, HWND hwndParent)
                 }
                 pItem->Release();
             }
-            else
+        }
+
+        // 兜底：选中项无法解析成文件系统路径时（网络位置 / Shell 命名空间项很常见），
+        // 至少把对话框当前所在的文件夹记录下来，避免“什么都没记住”。
+        if (!recordedFromItemArray)
+        {
+            IShellItem *pFolder = nullptr;
+            if (SUCCEEDED(pDialog->GetFolder(&pFolder)) && pFolder)
             {
-                IShellItem *pFolder = nullptr;
-                if (SUCCEEDED(pDialog->GetFolder(&pFolder)) && pFolder)
+                LPWSTR folderPath = nullptr;
+                if (SUCCEEDED(pFolder->GetDisplayName(SIGDN_FILESYSPATH, &folderPath)) && folderPath)
                 {
-                    LPWSTR folderPath = nullptr;
-                    if (SUCCEEDED(pFolder->GetDisplayName(SIGDN_FILESYSPATH, &folderPath)) && folderPath)
-                    {
-                        WritePathToHistory(folderPath);
-                        CoTaskMemFree(folderPath);
-                    }
-                    else
-                    {
-                        LPWSTR parsingPath = nullptr;
-                        if (SUCCEEDED(pFolder->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parsingPath)) && parsingPath)
-                        {
-                            WritePathToHistory(parsingPath);
-                            CoTaskMemFree(parsingPath);
-                        }
-                    }
-                    pFolder->Release();
+                    WriteFolderToHistory(folderPath);
+                    CoTaskMemFree(folderPath);
                 }
+                else
+                {
+                    LPWSTR parsingPath = nullptr;
+                    if (SUCCEEDED(pFolder->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parsingPath)) && parsingPath)
+                    {
+                        WriteFolderToHistory(parsingPath);
+                        CoTaskMemFree(parsingPath);
+                    }
+                }
+                pFolder->Release();
             }
         }
     }
@@ -238,7 +242,7 @@ void HookAllFileDialogVtables()
         DWORD oldProtect;
         if (VirtualProtect(showPtr, sizeof(void *), PAGE_EXECUTE_READWRITE, &oldProtect))
         {
-            *showPtr = Hook_IFileDialog_Show;
+            *showPtr = reinterpret_cast<void *>(Hook_IFileDialog_Show);
             VirtualProtect(showPtr, sizeof(void *), oldProtect, &oldProtect);
             g_hookedVtables.push_back({vtable, originalShow});
         }
