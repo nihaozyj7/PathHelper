@@ -56,7 +56,10 @@ void EnsureSettingsFile()
         "StripCommonPrefix=true\r\n"
         "\r\n"
         "# 历史记录可显示的最大条数（面板高度固定为5条，超出可通过滚动查看）\r\n"
-        "HistoryDisplayMax=5\r\n";
+        "HistoryDisplayMax=5\r\n"
+        "\r\n"
+        "# 是否在文件对话框里显示 Everything 搜索结果面板\r\n"
+        "EverythingPanel=true\r\n";
 
     HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE)
@@ -140,7 +143,84 @@ void LoadSettings(Settings &s)
             if (n >= 1)
                 s.historyDisplayMax = n;
         }
+        else if (key == L"EverythingPanel")
+            s.searchPanelEnabled = (value == L"true" || value == L"1" || value == L"yes");
+        else if (key == L"EverythingPanelWidth")
+        {
+            int n = _wtoi(value.c_str());
+            if (n >= 200)
+                s.searchPanelWidth = n;
+        }
+        else if (key == L"EverythingPanelHeight")
+        {
+            int n = _wtoi(value.c_str());
+            if (n >= 80)
+                s.searchPanelHeight = n;
+        }
     }
+}
+
+// ── 热加载 ──
+//
+// 被注入的进程（记事本等）里也会跑一份 Dll1，启动时只读一次配置的话，
+// 改完设置必须重启目标程序才生效。这里按"最后写入时间"判断配置有没有变，
+// 由宿主线程的目录变更通知驱动。
+
+static FILETIME g_lastSettingsWrite = {};
+static bool g_settingsWriteTimeValid = false;
+
+static bool GetSettingsWriteTime(FILETIME &out)
+{
+    std::wstring filePath = GetSettingsFilePath();
+    if (filePath.empty())
+        return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA info = {};
+    if (!GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &info))
+        return false;
+
+    out = info.ftLastWriteTime;
+    return true;
+}
+
+bool ReloadSettingsIfChanged(bool force)
+{
+    FILETIME current = {};
+    if (!GetSettingsWriteTime(current))
+        return false;
+
+    if (!force && g_settingsWriteTimeValid &&
+        current.dwLowDateTime == g_lastSettingsWrite.dwLowDateTime &&
+        current.dwHighDateTime == g_lastSettingsWrite.dwHighDateTime)
+        return false;
+
+    g_lastSettingsWrite = current;
+    g_settingsWriteTimeValid = true;
+
+    Settings fresh;
+    LoadSettings(fresh);
+    g_settings = fresh;
+    return true;
+}
+
+bool SaveSearchPanelSize(int width, int height)
+{
+    std::wstring filePath = GetSettingsFilePath();
+    if (filePath.empty())
+        return false;
+
+    wchar_t buf[32] = {};
+
+    _snwprintf_s(buf, 32, _TRUNCATE, L"%d", width);
+    WritePrivateProfileStringW(L"Settings", L"EverythingPanelWidth", buf, filePath.c_str());
+
+    _snwprintf_s(buf, 32, _TRUNCATE, L"%d", height);
+    WritePrivateProfileStringW(L"Settings", L"EverythingPanelHeight", buf, filePath.c_str());
+
+    // 同步内存值，免得自己写出来的变更又被当成"外部修改"来回弹
+    g_settings.searchPanelWidth = width;
+    g_settings.searchPanelHeight = height;
+    return true;
 }
 
 static bool IsSystemDarkMode()

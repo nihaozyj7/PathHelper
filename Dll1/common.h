@@ -24,6 +24,9 @@
 #define CDM_GETFILEPATH (CDM_FIRST + 0x0001)
 #define CDM_GETFOLDERPATH (CDM_FIRST + 0x0002)
 #define CDM_SETFOLDERPATH (CDM_FIRST + 0x0006)
+#define CDM_SETCONTROLTEXT (CDM_FIRST + 0x0004)
+// 通用对话框里"文件名"输入框的控件 ID (edt1)
+#define PH_EDT_FILENAME 0x0480
 
 // IFileDialog::Show is at vtable index 3 (per shobjidl.h; inherits IFileDialog -> IModalWindow -> IUnknown)
 #define IFileDialog_Show_Index 3
@@ -67,6 +70,9 @@ struct Settings
     int historyPanelFontSize;
     bool stripCommonPrefix;
     int historyDisplayMax;
+    bool searchPanelEnabled;   // Everything 搜索面板总开关
+    int searchPanelWidth;      // 0 = 自动（按内容）
+    int searchPanelHeight;     // 0 = 随结果条数自动
 
     Settings()
         : autoToLatest(false),
@@ -75,7 +81,10 @@ struct Settings
           panelMargin(5),
           historyPanelFontSize(10),
           stripCommonPrefix(true),
-          historyDisplayMax(5)
+          historyDisplayMax(5),
+          searchPanelEnabled(true),
+          searchPanelWidth(0),
+          searchPanelHeight(0)
     {
     }
 };
@@ -188,7 +197,42 @@ constexpr int EXPLORER_MAX = 5;
 constexpr int EXPLORER_DISPLAY_HEIGHT_ITEMS = 3;
 constexpr UINT WM_REFRESH_EXPLORER_PATHS = WM_APP + 103;
 constexpr UINT WM_REFRESH_FAV_STATE = WM_APP + 104;
+// 对话框原生搜索框文本变化（lParam = new std::wstring*，接收方负责 delete）
+constexpr UINT WM_EVERYTHING_SEARCH_TEXT = WM_APP + 105;
+// 在当前对话框内跳转到某个搜索结果（lParam = new std::wstring*，接收方负责 delete）
+constexpr UINT WM_NAVIGATE_RESULT = WM_APP + 106;
+// 自绘右键菜单选中某项（wParam = 命令 id，lParam = 结果下标）
+constexpr UINT WM_SEARCH_MENU_COMMAND = WM_APP + 107;
+// 配置文件变了，面板需要重新套用设置
+constexpr UINT WM_APPLY_SETTINGS = WM_APP + 108;
 constexpr int SEL_CORNER_RADIUS = 8;
+
+// ── 主题色（panel.cpp 中定义，搜索结果浮层复用） ──
+
+struct ThemeColors
+{
+    COLORREF bg;
+    COLORREF headerBg;
+    COLORREF itemText;
+    COLORREF itemTextSecondary;
+    COLORREF itemTitle;
+    COLORREF itemSep;
+    COLORREF selBg;
+    COLORREF selText;
+    COLORREF hoverBg;
+    COLORREF sep;
+    COLORREF border;
+    COLORREF btnBg;
+    COLORREF btnBorder;
+    COLORREF btnText;
+    COLORREF btnHoverBg;
+    COLORREF editBg;
+    COLORREF editBorder;
+    COLORREF accent;
+};
+
+ThemeColors GetThemeColors(bool isDark);
+bool IsDarkCached();
 
 extern int g_itemFontPixelHeight;
 extern int g_itemFontPixelHeightSecondary;

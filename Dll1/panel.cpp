@@ -2,6 +2,8 @@
 #include "panel.h"
 #include "history.h"
 #include "settings.h"
+#include "dialogsearch.h"
+#include "searchpanel.h"
 #include <uxtheme.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -103,31 +105,9 @@ void ComputeLayoutMetrics()
     ++g_textLayoutGeneration;
 }
 
-// ── Modern color palette ──
+// ── Modern color palette（ThemeColors 定义在 common.h，搜索结果浮层也要用） ──
 
-struct ThemeColors
-{
-    COLORREF bg;
-    COLORREF headerBg;
-    COLORREF itemText;
-    COLORREF itemTextSecondary;
-    COLORREF itemTitle;
-    COLORREF itemSep;
-    COLORREF selBg;
-    COLORREF selText;
-    COLORREF hoverBg;
-    COLORREF sep;
-    COLORREF border;
-    COLORREF btnBg;
-    COLORREF btnBorder;
-    COLORREF btnText;
-    COLORREF btnHoverBg;
-    COLORREF editBg;
-    COLORREF editBorder;
-    COLORREF accent;
-};
-
-static ThemeColors GetThemeColors(bool isDark)
+ThemeColors GetThemeColors(bool isDark)
 {
     if (isDark)
     {
@@ -177,7 +157,7 @@ static ThemeColors GetThemeColors(bool isDark)
     }
 }
 
-static bool IsDarkCached()
+bool IsDarkCached()
 {
     static std::wstring cachedTheme;
     static bool cachedResult = false;
@@ -1587,6 +1567,50 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
+    case WM_EVERYTHING_SEARCH_TEXT:
+    {
+        // 对话框原生搜索框的文本（由 dialogsearch 的监听线程投递过来）
+        std::wstring *text = reinterpret_cast<std::wstring *>(lp);
+        if (!text)
+            return 0;
+
+        if (!g_settings.searchPanelEnabled)
+        {
+            delete text;
+            return 0;
+        }
+
+        HWND hwndOverlay = (HWND)GetPropW(hwnd, L"SearchPanel");
+        if (!hwndOverlay || !IsWindow(hwndOverlay))
+        {
+            hwndOverlay = nullptr;
+            SetPropW(hwnd, L"SearchPanel", (HANDLE)nullptr);
+        }
+
+        if (text->empty() && !hwndOverlay)
+        {
+            delete text;
+            return 0;
+        }
+
+        if (!hwndOverlay)
+        {
+            HWND hwndDialog = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (hwndDialog && IsWindow(hwndDialog))
+            {
+                hwndOverlay = CreateSearchPanel(hwndDialog, hwnd);
+                if (hwndOverlay)
+                    SetPropW(hwnd, L"SearchPanel", (HANDLE)hwndOverlay);
+            }
+        }
+
+        if (hwndOverlay)
+            SearchPanelSetQuery(hwndOverlay, *text);
+
+        delete text;
+        return 0;
+    }
+
     case WM_COMMAND:
     {
         if (HIWORD(wp) == LBN_SELCHANGE)
@@ -2141,12 +2165,65 @@ LRESULT CALLBACK CompanionPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND hwndDialog = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         if (hwndDialog && IsWindow(hwndDialog))
             PositionPanel(hwndDialog, hwnd);
+
+        HWND hwndOverlay = (HWND)GetPropW(hwnd, L"SearchPanel");
+        if (hwndOverlay && IsWindow(hwndOverlay))
+            SearchPanelReposition(hwndOverlay);
         return 0;
     }
+    case WM_APPLY_SETTINGS:
+    {
+        // 配置文件变了（主题/宽度/字号/开关），把设置重新套到面板上
+        HWND hwndDialog = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (hwndDialog && IsWindow(hwndDialog))
+            PositionPanel(hwndDialog, hwnd);
+
+        HWND hwndOverlay = (HWND)GetPropW(hwnd, L"SearchPanel");
+
+        if (!g_settings.searchPanelEnabled)
+        {
+            if (hwndDialog)
+                StopDialogSearchWatch(hwndDialog);
+
+            if (hwndOverlay && IsWindow(hwndOverlay))
+            {
+                RemovePropW(hwnd, L"SearchPanel");
+                DestroySearchPanel(hwndOverlay);
+            }
+        }
+        else
+        {
+            // 之前关掉过就重新开始监听（重复调用是安全的）
+            if (hwndDialog)
+                StartDialogSearchWatch(hwndDialog, hwnd);
+
+            if (hwndOverlay && IsWindow(hwndOverlay))
+                SearchPanelReposition(hwndOverlay);
+        }
+
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
     case WM_DESTROY:
     {
         KillTimer(hwnd, 1);
         DestroyWindowBackBuffer(hwnd);
+
+        // 结束搜索框监听并销毁 Everything 结果浮层
+        {
+            HWND hwndDialogForWatch = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (hwndDialogForWatch)
+                StopDialogSearchWatch(hwndDialogForWatch);
+
+            HWND hwndOverlay = (HWND)GetPropW(hwnd, L"SearchPanel");
+            if (hwndOverlay)
+            {
+                RemovePropW(hwnd, L"SearchPanel");
+                DestroySearchPanel(hwndOverlay);
+            }
+        }
+
         auto *paths = (std::vector<std::wstring> *)GetPropW(hwnd, L"HistoryPaths");
         if (paths)
         {
@@ -2297,6 +2374,11 @@ std::wstring histPrefix = g_settings.stripCommonPrefix ? CommonPathPrefix(std::v
     ShowWindow(hwndPanel, SW_SHOWNA);
     SetPanelRegion(hwndPanel);
     UpdateFavBtnMode(hwndPanel, true);
+
+    // 监听对话框自带的搜索框，把关键字转发给 Everything 结果浮层
+    // 设置里关掉了 Everything 搜索面板就不必监听对话框的搜索框
+    if (g_settings.searchPanelEnabled)
+        StartDialogSearchWatch(hwndDialog, hwndPanel);
 
     return hwndPanel;
 }

@@ -3,7 +3,10 @@
 #include "history.h"
 #include "hooking.h"
 #include "panel.h"
+#include "dialogsearch.h"
+#include "searchpanel.h"
 #include <commdlg.h>
+#include <ole2.h>
 
 // {71A5BA9E-0A34-4afc-B1E1-DFD7DD3F95D7}
 static const GUID SID_SExplorerBrowser = { 0x71A5BA9E, 0x0A34, 0x4AFC, { 0xB1, 0xE1, 0xDF, 0xD7, 0xDD, 0x3F, 0x95, 0xD7 } };
@@ -196,6 +199,48 @@ static void NavigateClassicDialog(HWND hwnd, const std::wstring &path)
         return;
 
     SendMessageW(hwnd, CDM_SETFOLDERPATH, 0, (LPARAM)targetPath.c_str());
+}
+
+// 把文件名填进对话框的"文件名"输入框
+static void SetDialogFileName(HWND hwnd, const std::wstring &name)
+{
+    if (name.empty())
+        return;
+
+    EnterCriticalSection(&g_cs);
+    auto it = g_threadFileDialogs.find(GetCurrentThreadId());
+    IFileDialog *pFD = (it != g_threadFileDialogs.end()) ? it->second : nullptr;
+    LeaveCriticalSection(&g_cs);
+
+    if (pFD && SUCCEEDED(pFD->SetFileName(name.c_str())))
+        return;
+
+    SendMessageW(hwnd, CDM_SETCONTROLTEXT, PH_EDT_FILENAME,
+                 reinterpret_cast<LPARAM>(name.c_str()));
+}
+
+// "在当前窗口打开"一个搜索结果：
+//   文件夹 → 直接导航过去
+//   文件   → 跳到所在目录，并把文件名填好
+static void NavigateDialogToResult(HWND hwnd, const std::wstring &path)
+{
+    if (path.empty())
+        return;
+
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    bool isFolder = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+
+    if (isFolder)
+    {
+        NavigateClassicDialog(hwnd, path);
+        return;
+    }
+
+    NavigateClassicDialog(hwnd, ResolveDirectoryPath(path));
+
+    size_t pos = path.rfind(L'\\');
+    if (pos != std::wstring::npos && pos + 1 < path.size())
+        SetDialogFileName(hwnd, path.substr(pos + 1));
 }
 
 static bool IsFileDialog(HWND hwnd)
@@ -507,6 +552,14 @@ static LRESULT CALLBACK DialogSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, 
         NavigateClassicDialog(hwnd, targetPath);
         return 0;
     }
+    else if (uMsg == WM_NAVIGATE_RESULT)
+    {
+        auto *pathCopy = (std::wstring *)lParam;
+        std::wstring targetPath = *pathCopy;
+        delete pathCopy;
+        NavigateDialogToResult(hwnd, targetPath);
+        return 0;
+    }
     else if (uMsg == WM_QUERY_FOLDER_PATH)
     {
         std::wstring path;
@@ -684,9 +737,11 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
 static DWORD WINAPI HookThread(LPVOID)
 {
     EnsureSettingsFile();
-    LoadSettings(g_settings);
+    ReloadSettingsIfChanged(true);
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // OleInitialize 会同时完成 CoInitializeEx(APARTMENTTHREADED)，
+    // 搜索结果浮层的 DoDragDrop 依赖它。
+    OleInitialize(nullptr);
 
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_pD2DFactory);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -729,6 +784,7 @@ static DWORD WINAPI HookThread(LPVOID)
         wc.lpszClassName = PANEL_CLASS;
         RegisterClassExW(&wc);
         RegisterCustomListClass();
+        RegisterSearchPanelClass();
     }
 
     if (g_hEventHook)
@@ -751,11 +807,22 @@ static DWORD WINAPI HookThread(LPVOID)
 
             if (g_hExplorerPathsNotify && dwResult == WAIT_OBJECT_0 + 1)
             {
+                // Setting.ini 就在这个目录里，所以"设置改过了"这件事
+                // 直接复用同一个目录变更通知，不用额外轮询。
+                bool settingsChanged = ReloadSettingsIfChanged(false);
+                if (settingsChanged)
+                    ComputeLayoutMetrics(); // 重建字体 / DirectWrite 文本格式
+                else
+                    g_historyCacheValid = false; // Favorites/历史文件变了
+
                 EnterCriticalSection(&g_cs);
                 for (auto &pair : g_dialogs)
                 {
-                    if (pair.second.hwndPanel && IsWindow(pair.second.hwndPanel))
-                        PostMessageW(pair.second.hwndPanel, WM_REFRESH_EXPLORER_PATHS, 0, 0);
+                    if (!pair.second.hwndPanel || !IsWindow(pair.second.hwndPanel))
+                        continue;
+                    if (settingsChanged)
+                        PostMessageW(pair.second.hwndPanel, WM_APPLY_SETTINGS, 0, 0);
+                    PostMessageW(pair.second.hwndPanel, WM_REFRESH_EXPLORER_PATHS, 0, 0);
                 }
                 LeaveCriticalSection(&g_cs);
                 FindNextChangeNotification(g_hExplorerPathsNotify);
@@ -775,6 +842,8 @@ static DWORD WINAPI HookThread(LPVOID)
         g_hExplorerPathsNotify = nullptr;
     }
 
+    StopAllDialogSearchWatches();
+
     ReleaseDWriteCache();
 
     if (g_pItemTextFormat) { g_pItemTextFormat->Release(); g_pItemTextFormat = nullptr; }
@@ -784,7 +853,7 @@ static DWORD WINAPI HookThread(LPVOID)
     if (g_pDWriteFactory) { g_pDWriteFactory->Release(); g_pDWriteFactory = nullptr; }
     if (g_pD2DFactory) { g_pD2DFactory->Release(); g_pD2DFactory = nullptr; }
 
-    CoUninitialize();
+    OleUninitialize();
     return 0;
 }
 

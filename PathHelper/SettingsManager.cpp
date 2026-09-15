@@ -23,6 +23,8 @@ static const struct
     {L"StripCommonPrefix", L"true", IDC_CHK_STRIPCOMMONPREFIX, true, false, 0},
     {L"HistoryDisplayMax", L"5", IDC_EDIT_HISTORYDISPLAYMAX, false, false, 5},
     {L"AutoStartToTray", L"false", IDC_CHK_AUTOSTARTTOTRAY, true, false, 0},
+    {L"ExplorerFavorites", L"false", IDC_CHK_EXPLORERFAVORITES, true, false, 0},
+    {L"EverythingPanel", L"true", IDC_CHK_EVERYTHINGPANEL, true, false, 0},
 };
 
 static const int g_settingCount = sizeof(g_settingDefs) / sizeof(g_settingDefs[0]);
@@ -31,12 +33,14 @@ void LoadSettingsToUI(HWND hChkAutoToLatest, HWND hCboTheme,
                        HWND hEditHistoryWidth, HWND hEditHistoryFontSize,
                        HWND hEditPanelMargin, HWND hChkStripCommonPrefix,
                        HWND hEditHistoryDisplayMax, HWND hEditTimeFormat, HWND hHotKeyTimePaste,
-                       HWND hChkAutoStartToTray)
+                       HWND hChkAutoStartToTray, HWND hChkExplorerFavorites,
+                       HWND hChkEverythingPanel)
 {
     HWND controls[] = {
         hChkAutoToLatest, hCboTheme,
         hEditHistoryWidth, hEditHistoryFontSize,
-        hEditPanelMargin, hChkStripCommonPrefix, hEditHistoryDisplayMax, hChkAutoStartToTray
+        hEditPanelMargin, hChkStripCommonPrefix, hEditHistoryDisplayMax, hChkAutoStartToTray,
+        hChkExplorerFavorites, hChkEverythingPanel
     };
 
     WCHAR buf[2048];
@@ -86,12 +90,14 @@ void SaveSettingsFromUI(HWND hChkAutoToLatest, HWND hCboTheme,
                         HWND hEditHistoryWidth, HWND hEditHistoryFontSize,
                         HWND hEditPanelMargin, HWND hChkStripCommonPrefix,
                         HWND hEditHistoryDisplayMax, HWND hEditTimeFormat,
-                        HWND hChkAutoStartToTray)
+                        HWND hChkAutoStartToTray, HWND hChkExplorerFavorites,
+                        HWND hChkEverythingPanel)
 {
     HWND controls[] = {
         hChkAutoToLatest, hCboTheme,
         hEditHistoryWidth, hEditHistoryFontSize,
-        hEditPanelMargin, hChkStripCommonPrefix, hEditHistoryDisplayMax, hChkAutoStartToTray
+        hEditPanelMargin, hChkStripCommonPrefix, hEditHistoryDisplayMax, hChkAutoStartToTray,
+        hChkExplorerFavorites, hChkEverythingPanel
     };
 
     WCHAR buf[2048];

@@ -1,4 +1,4 @@
-﻿// PathHelper.cpp
+// PathHelper.cpp
 //
 
 #include "framework.h"
@@ -10,6 +10,7 @@
 #include "Dialogs.h"
 #include "ExplorerMonitor.h"
 #include "AutoStartManager.h"
+#include "ExplorerFavorites.h"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <ctime>
@@ -21,7 +22,7 @@
 #define MAX_LOADSTRING 100
 
 #define WINDOW_W 640
-#define WINDOW_H 520
+#define WINDOW_H 644
 #define TAB_H 32
 #define PAGE_Y 38
 #define PAGE_X 20
@@ -57,6 +58,8 @@ HWND g_hHotKeyTimePaste = NULL;
 HWND g_hChkAutoStartToTray = NULL;
 HWND g_hChkStripCommonPrefix = NULL;
 HWND g_hEditHistoryDisplayMax = NULL;
+HWND g_hChkExplorerFavorites = NULL;
+HWND g_hChkEverythingPanel = NULL;
 HWND g_hWndMain = NULL;
 bool g_timeHotkeyRegistered = false;
 bool g_autoStartToTray = false;
@@ -131,8 +134,16 @@ void InitDataDirectory()
         WritePrivateProfileStringW(L"Settings", L"TimeFormat", L"%Y-%m-%d %H:%M:%S", g_szIniPath);
         WritePrivateProfileStringW(L"Settings", L"TimeHotkeyVK", L"0", g_szIniPath);
         WritePrivateProfileStringW(L"Settings", L"TimeHotkeyMod", L"0", g_szIniPath);
+        WritePrivateProfileStringW(L"Settings", L"ExplorerFavorites", L"false", g_szIniPath);
         WritePrivateProfileStringW(L"Injection", L"Count", L"0", g_szIniPath);
     }
+
+    // 旧版本升级上来的 ini 里可能没有这一项，补一个默认值，
+    // 这样注入到 explorer.exe 的 Dll2.dll 才能读到开关。
+    WCHAR explorerFav[32] = {};
+    GetPrivateProfileStringW(L"Settings", L"ExplorerFavorites", L"", explorerFav, 32, g_szIniPath);
+    if (explorerFav[0] == L'\0')
+        WritePrivateProfileStringW(L"Settings", L"ExplorerFavorites", L"false", g_szIniPath);
 }
 
 void AddInjectionProcess(HWND hWnd)
@@ -269,7 +280,8 @@ void SwitchTab(HWND hWnd, int index)
                          g_hEditHistoryWidth, g_hEditHistoryFontSize,
                          g_hEditPanelMargin, g_hChkStripCommonPrefix,
                          g_hEditHistoryDisplayMax, g_hEditTimeFormat, g_hHotKeyTimePaste,
-                         g_hChkAutoStartToTray);
+                         g_hChkAutoStartToTray, g_hChkExplorerFavorites,
+                         g_hChkEverythingPanel);
 }
 
 static void CreateInjectionTabControls(HWND hWnd)
@@ -394,6 +406,32 @@ static void CreateSettingsTabControls(HWND hWnd)
                                              WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
                                              editX, y, 20, 24, hWnd, reinterpret_cast<HMENU>(IDC_CHK_AUTOSTARTTOTRAY), hInst, NULL);
     g_setControls.push_back(g_hChkAutoStartToTray);
+
+    y += ROW_H;
+    g_setControls.push_back(CreateWindowExW(0, L"STATIC", L"\U0001F4C2 \u8d44\u6e90\u7ba1\u7406\u5668\u6536\u85cf\u9762\u677f:",
+                                            WS_CHILD | SS_RIGHT,
+                                            labelX, y, LABEL_W, 24, hWnd, NULL, hInst, NULL));
+    g_hChkExplorerFavorites = CreateWindowExW(0, L"BUTTON", L"",
+                                              WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                              editX, y, 20, 24, hWnd, reinterpret_cast<HMENU>(IDC_CHK_EXPLORERFAVORITES), hInst, NULL);
+    g_setControls.push_back(g_hChkExplorerFavorites);
+    g_setControls.push_back(CreateWindowExW(0, L"STATIC",
+                                            L"\u5f00\u542f\u540e\u5411 explorer.exe \u6ce8\u5165\u4ec5\u4fdd\u7559\u6536\u85cf\u7684\u4fa7\u8fb9\u9762\u677f",
+                                            WS_CHILD | SS_LEFT,
+                                            editX + 28, y + 2, contentW - 28, 22, hWnd, NULL, hInst, NULL));
+
+    y += ROW_H;
+    g_setControls.push_back(CreateWindowExW(0, L"STATIC", L"\U0001F50D Everything \u641c\u7d22\u9762\u677f:",
+                                            WS_CHILD | SS_RIGHT,
+                                            labelX, y, LABEL_W, 24, hWnd, NULL, hInst, NULL));
+    g_hChkEverythingPanel = CreateWindowExW(0, L"BUTTON", L"",
+                                            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                            editX, y, 20, 24, hWnd, reinterpret_cast<HMENU>(IDC_CHK_EVERYTHINGPANEL), hInst, NULL);
+    g_setControls.push_back(g_hChkEverythingPanel);
+    g_setControls.push_back(CreateWindowExW(0, L"STATIC",
+                                            L"\u5728\u6587\u4ef6\u5bf9\u8bdd\u6846\u7684\u641c\u7d22\u6846\u4e0b\u663e\u793a Everything \u7ed3\u679c",
+                                            WS_CHILD | SS_LEFT,
+                                            editX + 28, y + 2, contentW - 28, 22, hWnd, NULL, hInst, NULL));
 
     y += ROW_H + 4;
     g_setControls.push_back(CreateWindowExW(0, L"STATIC", L"\U0001F4D0 \u5386\u53f2\u9762\u677f\u5bbd\u5ea6:",
@@ -520,8 +558,10 @@ SaveSettingsFromUI(g_hChkAutoToLatest, g_hCboTheme,
                                 g_hEditHistoryWidth, g_hEditHistoryFontSize,
                                 g_hEditPanelMargin, g_hChkStripCommonPrefix,
                                 g_hEditHistoryDisplayMax, g_hEditTimeFormat,
-                                g_hChkAutoStartToTray);
+                                g_hChkAutoStartToTray, g_hChkExplorerFavorites,
+                                g_hChkEverythingPanel);
             RegisterTimeHotkeyFromControl();
+            MonitorExplorerFavorites();
             MessageBoxW(hWnd, L"\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002", L"PathHelper", MB_OK | MB_ICONINFORMATION);
             break;
         case IDM_ABOUT:
@@ -558,6 +598,7 @@ SaveSettingsFromUI(g_hChkAutoToLatest, g_hCboTheme,
         else if (wParam == IDT_PROCESS_MONITOR)
         {
             MonitorProcesses();
+            MonitorExplorerFavorites();
             RefreshInjectionListView(g_hInjList);
         }
         else if (wParam == IDT_EXPLORER_MONITOR)
@@ -711,6 +752,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     InitDataDirectory();
     LoadInjectionList();
+    InitExplorerFavorites();
     InitExplorerMonitor();
 
     if (!InitInstance(hInstance, g_autoStartToTray ? SW_HIDE : nCmdShow))
@@ -729,6 +771,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     CleanupExplorerMonitor();
+    CleanupExplorerFavorites();
     CloseHandle(hMutex);
     return static_cast<int>(msg.wParam);
 }

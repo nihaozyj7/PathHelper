@@ -12,7 +12,8 @@
 
     说明：
       * 产物为静态链接，不依赖 libstdc++-6.dll / libwinpthread-1.dll。
-      * Dll1.dll 必须和 PathHelper.exe 放在同一目录（注入器按此查找）。
+      * Dll1.dll / Dll2.dll 必须和 PathHelper.exe 放在同一目录（注入器按此查找）。
+        Dll1.dll = 文件对话框增强面板；Dll2.dll = 资源管理器收藏面板。
       * Visual Studio 工程 (.sln/.vcxproj) 依然可用，本脚本只是另一条构建路径。
       * 脚本内部全部使用相对路径：windres 无法处理含中文的绝对路径。
 #>
@@ -48,6 +49,7 @@ Write-Host "windres : $windres"
 
 $incPathHelper = 'PathHelper'
 $incDll1       = 'Dll1'
+$incDll2       = 'Dll2'
 
 # 公共编译参数：x64 / Unicode / C++17 / 静态链接
 $common = @(
@@ -128,12 +130,27 @@ $dllArgs += @(Get-ChildItem (Join-Path $incDll1 '*.cpp') |
 $dllArgs += @('-o', $dllOut)
 $dllArgs += @('-lole32', '-loleaut32', '-luuid', '-lshell32', '-lcomctl32',
               '-ld2d1', '-ldwrite', '-luxtheme', '-lshlwapi', '-luser32',
-              '-lgdi32', '-ladvapi32')
+              '-lgdi32', '-ladvapi32', '-luiautomationcore')
 & $gpp @dllArgs
 if ($LASTEXITCODE -ne 0) { throw 'Dll1.dll 编译失败' }
 
 # ---------------------------------------------------------------
-# 5. 结果
+# 5. Dll2.dll（注入到 explorer.exe 的收藏面板）
+# ---------------------------------------------------------------
+Write-Host '==> 编译 Dll2.dll'
+$favOut = Join-Path $outDir 'Dll2.dll'
+$favArgs = $common.Clone()
+$favArgs += @('-shared', '-D_USRDLL', '-I', $incDll2)
+$favArgs += @(Get-ChildItem (Join-Path $incDll2 '*.cpp') |
+              ForEach-Object { Join-Path $incDll2 $_.Name })
+$favArgs += @('-o', $favOut)
+$favArgs += @('-lole32', '-loleaut32', '-luuid', '-lshell32', '-lcomctl32',
+              '-lshlwapi', '-luser32', '-lgdi32', '-ladvapi32')
+& $gpp @favArgs
+if ($LASTEXITCODE -ne 0) { throw 'Dll2.dll 编译失败' }
+
+# ---------------------------------------------------------------
+# 6. 结果
 # ---------------------------------------------------------------
 Write-Host ''
 Write-Host '构建完成，输出目录: ' -NoNewline

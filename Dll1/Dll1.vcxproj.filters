@@ -38,6 +38,15 @@
     <ClInclude Include="settings.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="everything.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dialogsearch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="searchpanel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="nlohmann\json.hpp">
       <Filter>Header Files\nlohmann</Filter>
     </ClInclude>
@@ -62,6 +71,15 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="everything.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dialogsearch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="searchpanel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
